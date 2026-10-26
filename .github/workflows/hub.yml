@@ -1,0 +1,111 @@
+# Stub of the reusable hub workflow for the dummy-harness repo (A8 §3.2; build-plan WP-14). It writes
+# a fixed tree in place of hub.mjs; its push step is the push step of .github/workflows/hub.yml of
+# pep-harness, the same text (a test of pep-harness checks it).
+name: hub
+on:
+  workflow_call:
+    secrets:
+      PEP_HUB_TOKEN: { required: false }   # an empty token stops the push step (A1 §7.4)
+permissions: { contents: read }
+jobs:
+  hub:
+    runs-on: ubuntu-latest
+    environment: hub
+    concurrency: { group: "hub-${{ github.ref }}", cancel-in-progress: true }
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: fixed tree
+        env:
+          HUB_OUT: ${{ runner.temp }}/hub
+          DOCS_SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HUB_OUT/dummy-hub/specs/demo"
+          echo "Generated from dummy-spec $DOCS_SHA. Do not edit; changes go to dummy-spec." > "$HUB_OUT/dummy-hub/README.md"
+          printf 'openapi: 3.1.0\ninfo: { title: demo, version: %s }\npaths: {}\n' "$([ "$REF_TYPE" = tag ] && echo "${REF_NAME#v}" || echo 0.0.0)" > "$HUB_OUT/dummy-hub/specs/demo/openapi.yaml"
+      - name: push
+        env:
+          PEP_HUB_TOKEN: ${{ secrets.PEP_HUB_TOKEN }}
+          HUB_OUT: ${{ runner.temp }}/hub
+          DOCS: ${{ github.workspace }}
+          DOCS_REPO: ${{ github.event.repository.name }}
+          DOCS_SHA: ${{ github.sha }}
+          OWNER: ${{ github.repository_owner }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${PEP_HUB_TOKEN:-}" ] || { echo "::error::hub: PEP_HUB_TOKEN is empty: environment hub, refs develop, pre-release, v*"; exit 1; }
+          shopt -s nullglob
+          case "$REF_TYPE" in
+            branch) ;;
+            tag) [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::hub: tag $REF_NAME is not vX.Y.Z"; exit 2; } ;;
+            *) echo "::error::hub: ref type $REF_TYPE is not branch or tag"; exit 2 ;;
+          esac
+          docs_commit=$(git -C "$DOCS" rev-parse --verify "$DOCS_SHA^{commit}")
+          message="from $DOCS_REPO $docs_commit"
+          export GIT_AUTHOR_NAME="pep hub" GIT_AUTHOR_EMAIL="pep-hub@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="pep hub" GIT_COMMITTER_EMAIL="pep-hub@users.noreply.github.com"
+          # git reads the token from the env through this helper: never in a URL or an argument.
+          # shellcheck disable=SC2016 # $PEP_HUB_TOKEN expands in the helper's shell, not here
+          auth=(-c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$PEP_HUB_TOKEN"; }; f')
+          trees=("$HUB_OUT"/*/)
+          [ "${#trees[@]}" -gt 0 ] || { echo "::error::hub: no hub tree in $HUB_OUT"; exit 2; }
+          for tree_dir in "${trees[@]}"; do
+            hub=$(basename "$tree_dir")
+            url="$GITHUB_SERVER_URL/$OWNER/$hub.git"
+            repo="$RUNNER_TEMP/hub-git/$hub"
+            rm -rf "$repo"
+            git init -q --bare "$repo"
+            git --git-dir="$repo" "${auth[@]}" fetch -q --no-tags "$url" '+refs/heads/*:refs/hub/heads/*' '+refs/tags/*:refs/hub/tags/*'
+            # The hub ref becomes this tree exactly: a file not in it is deleted.
+            # No attributes and no line-end change: each blob is the byte copy of the file (git >= 2.42).
+            GIT_INDEX_FILE="$repo/pep-index" git -C "$tree_dir" --git-dir="$repo" --work-tree=. \
+              --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 -c core.autocrlf=false add -A -f .
+            tree=$(GIT_INDEX_FILE="$repo/pep-index" git --git-dir="$repo" write-tree)
+            if [ "$REF_TYPE" = branch ]; then
+              head=$(git --git-dir="$repo" rev-parse -q --verify "refs/hub/heads/$REF_NAME^{commit}" || true)
+              parent=()
+              if [ -n "$head" ]; then
+                if [ "$(git --git-dir="$repo" rev-parse "$head^{tree}")" = "$tree" ]; then
+                  echo "hub: $hub $REF_NAME: equal tree, no commit"
+                  continue
+                fi
+                parent=(-p "$head")
+              fi
+            else
+              if git --git-dir="$repo" rev-parse -q --verify "refs/hub/tags/$REF_NAME" > /dev/null; then
+                [ "$(git --git-dir="$repo" rev-parse "refs/hub/tags/$REF_NAME^{tree}")" = "$tree" ] ||
+                  echo "::warning::hub: $hub $REF_NAME exists with another tree; a hub tag never moves"
+                echo "hub: $hub $REF_NAME: the tag exists, no commit"
+                continue
+              fi
+              # Parent: the hub commit whose message names the nearest first-parent ancestor of the
+              # tagged docs commit; else the hub pre-release head (behavior-16).
+              unset named
+              declare -A named=()
+              for b in pre-release $(git --git-dir="$repo" for-each-ref --format='%(refname:lstrip=3)' refs/hub/heads/); do
+                git --git-dir="$repo" rev-parse -q --verify "refs/hub/heads/$b" > /dev/null || continue
+                while read -r c from name sha; do
+                  if [ "$from $name" = "from $DOCS_REPO" ] && [ -n "$sha" ] && [ -z "${named[$sha]:-}" ]; then named[$sha]=$c; fi
+                done < <(git --git-dir="$repo" log --format='%H %s' "refs/hub/heads/$b")
+              done
+              found=""
+              while read -r d; do
+                if [ -n "${named[$d]:-}" ]; then found=${named[$d]}; break; fi
+              done < <(git -C "$DOCS" rev-list --first-parent "$docs_commit")
+              [ -n "$found" ] || found=$(git --git-dir="$repo" rev-parse -q --verify "refs/hub/heads/pre-release^{commit}" || true)
+              parent=()
+              if [ -n "$found" ]; then parent=(-p "$found"); else echo "::warning::hub: $hub has no pre-release: $REF_NAME gets a root commit"; fi
+            fi
+            commit=$(git --git-dir="$repo" commit-tree "$tree" "${parent[@]}" -m "$message")
+            if [ "$REF_TYPE" = branch ]; then target="refs/heads/$REF_NAME"; else target="refs/tags/$REF_NAME"; fi
+            git --git-dir="$repo" "${auth[@]}" push -q "$url" "$commit:$target"
+            echo "hub: $hub $REF_NAME: pushed $commit ($message)"
+          done

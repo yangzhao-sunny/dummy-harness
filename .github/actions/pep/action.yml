@@ -1,0 +1,20 @@
+# Stub of the harness action for the dummy-harness repo (A8 §3.2; build-plan WP-14). It prints its
+# args and writes PEP_HARNESS, as the real action does (.github/actions/pep/action.yml of pep-harness).
+name: pep
+description: Stub of the pep harness action; prints its args and writes PEP_HARNESS.
+inputs:
+  args: { description: "the arguments of pep; empty: set up only", required: false, default: "" }
+  tools: { description: "space-separated harness-pinned tools", required: false, default: "" }
+runs:
+  using: composite
+  steps:
+    - name: stub
+      shell: bash
+      env:
+        PEP_ARGS: ${{ inputs.args }}
+        PEP_TOOLS: ${{ inputs.tools }}
+      run: |
+        set -euo pipefail
+        root=$(cd "$GITHUB_ACTION_PATH/../../.." && pwd -P)
+        echo "PEP_HARNESS=$root" >> "$GITHUB_ENV"
+        printf 'pep stub: args=[%s] tools=[%s] harness=%s\n' "$PEP_ARGS" "$PEP_TOOLS" "$root"
